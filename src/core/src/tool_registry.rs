@@ -9,8 +9,9 @@ use crate::dense_cache::{DenseCache, Embeddable};
 use crate::embedding::EmbedderError;
 use crate::embedding_artifact::{ArtifactEntryKind, ArtifactError};
 use crate::embedding_config::EmbeddingModel;
+use crate::field_search::{Bm25fCache, FieldWeights};
 use crate::fusion::{RETRIEVE_DEPTH, RRF_K, WeightedArm, rrf_fuse_weighted};
-use crate::indexing::searchable_text;
+use crate::indexing::{ToolFields, searchable_fields, searchable_text};
 use crate::method::SearchMethod;
 use crate::search::Bm25Cache;
 use crate::tool::Tool;
@@ -137,6 +138,13 @@ pub struct ToolRegistry {
     /// state instead of once per search. Scores are byte-identical to a fresh
     /// build (ADR-0011).
     bm25: Bm25Cache,
+    /// Prebuilt BM25F index over the same corpus, built only while
+    /// field-weighted ranking is on (ADR-0023). Every mutation that
+    /// invalidates `bm25` invalidates this too, and so does a weight change.
+    bm25f: Bm25fCache,
+    /// The field weights while experimental field-weighted ranking is on.
+    /// `None`, the default, scores the flattened document exactly as before.
+    field_weights: Option<FieldWeights>,
     /// Dense embeddings for `tools`, keyed by id and built on demand. `register`
     /// invalidates a replaced id; the missing ids are embedded by
     /// [`Self::build_embeddings`] — a search never embeds the corpus (it requires
@@ -165,6 +173,8 @@ impl ToolRegistry {
             sink: Arc::new(NoopSink),
             experimental_catalog_definitions: false,
             bm25: Bm25Cache::new(),
+            bm25f: Bm25fCache::new(),
+            field_weights: None,
             dense: DenseCache::new(),
             graph: None,
         }
@@ -177,6 +187,8 @@ impl ToolRegistry {
             sink,
             experimental_catalog_definitions: false,
             bm25: Bm25Cache::new(),
+            bm25f: Bm25fCache::new(),
+            field_weights: None,
             dense: DenseCache::new(),
             graph: None,
         }
@@ -193,6 +205,8 @@ impl ToolRegistry {
             sink: Arc::new(NoopSink),
             experimental_catalog_definitions: false,
             bm25: Bm25Cache::new(),
+            bm25f: Bm25fCache::new(),
+            field_weights: None,
             dense: DenseCache::with_model(model),
             graph: None,
         }
@@ -207,6 +221,35 @@ impl ToolRegistry {
     /// Enable experimental complete catalog-definition events for later registrations.
     pub fn experimental_enable_catalog_definitions(&mut self) {
         self.experimental_catalog_definitions = true;
+    }
+
+    /// Rank lexically with experimental field weights instead of one flattened
+    /// document (ADR-0023).
+    ///
+    /// The flattened projection scores name, description and schema tokens as
+    /// one document, so every field competes on the same footing and field
+    /// length settles what is left (issue #56). With weights on, each field
+    /// carries its own multiplier and its own length normalization, so a short
+    /// name field stops being normalized like free text.
+    ///
+    /// This replaces the lexical scorer only: the `Bm25` method, and the
+    /// lexical arm inside `Hybrid`. Dense ranking and fusion are untouched, and
+    /// so is the `searchable_text` projection every other layer reads.
+    /// [`FieldWeights::default`] is the starting point.
+    pub fn experimental_enable_field_weighted_ranking(&mut self, weights: FieldWeights) {
+        self.field_weights = Some(weights);
+        self.bm25f.invalidate();
+    }
+
+    /// Go back to the flattened BM25 document. Scores return to exactly what
+    /// they were before field weights were enabled.
+    pub fn experimental_disable_field_weighted_ranking(&mut self) {
+        self.field_weights = None;
+    }
+
+    /// The active field weights, or `None` while the flattened default ranks.
+    pub fn experimental_field_weighted_ranking(&self) -> Option<FieldWeights> {
+        self.field_weights
     }
 
     /// Record an arbitrary [`TraceEvent`] on the registry's sink. Higher
@@ -511,6 +554,7 @@ impl ToolRegistry {
         // Add or replace, the corpus changed either way: the prebuilt BM25
         // index no longer matches it.
         self.bm25.invalidate();
+        self.bm25f.invalidate();
         if self.tools.insert(tool_id.clone(), tool).is_some() {
             // Replaced an existing id: drop its stale embedding.
             self.dense.invalidate(&tool_id);
@@ -753,6 +797,35 @@ impl ToolRegistry {
         self.bm25.get_or_build(|| self.bm25_docs())
     }
 
+    /// The corpus as `(id, fields)` pairs for BM25F.
+    fn bm25f_docs(&self) -> impl Iterator<Item = (String, ToolFields)> + '_ {
+        self.tools
+            .values()
+            .map(|t| (t.id.clone(), searchable_fields(t)))
+    }
+
+    /// Rank with whichever lexical scorer is active: the flattened document by
+    /// default, field weights when they are enabled.
+    fn lexical_ranked(&self, query: &str, top_k: usize) -> Vec<(String, f32)> {
+        match self.field_weights {
+            None => self.bm25_index().search(query, top_k),
+            Some(weights) => self
+                .bm25f
+                .get_or_build(weights, || self.bm25f_docs())
+                .search(query, top_k),
+        }
+    }
+
+    /// The trace stage name for the active lexical scorer, so a recorded
+    /// search says which one produced its scores.
+    fn lexical_stage(&self) -> &'static str {
+        if self.field_weights.is_some() {
+            "bm25f"
+        } else {
+            "bm25"
+        }
+    }
+
     /// Fuse the ranked arms into the final top-`top_k`, returning the hits and
     /// the `rrf` stage. Shared by all three engines so the fusion, truncation,
     /// and `(score desc, id asc)` ordering have exactly one implementation.
@@ -801,7 +874,7 @@ impl ToolRegistry {
             // No graph, or nothing matched: the original path, unchanged, with
             // raw BM25 scores. ADR-0011's byte-for-byte promise lives here.
             // Raw BM25 scores — not fused.
-            let hits = to_search_hits(self.bm25_index().search(query, top_k), false);
+            let hits = to_search_hits(self.lexical_ranked(query, top_k), false);
             let took_ms = started.elapsed().as_millis() as u64;
             let top_score = hits.first().map(|h| h.score as f64);
             self.record_search(
@@ -810,7 +883,7 @@ impl ToolRegistry {
                 top_k,
                 &hits,
                 vec![SearchStage {
-                    name: "bm25".into(),
+                    name: self.lexical_stage().into(),
                     took_ms,
                     top_score,
                 }],
@@ -825,9 +898,9 @@ impl ToolRegistry {
         // scores — the opt-in cost documented on `set_intent_graph`.
         let depth = RETRIEVE_DEPTH.max(top_k);
         let t = Instant::now();
-        let bm25_ranked = self.bm25_index().search(query, depth);
+        let bm25_ranked = self.lexical_ranked(query, depth);
         let bm25_stage = SearchStage {
-            name: "bm25".into(),
+            name: self.lexical_stage().into(),
             took_ms: t.elapsed().as_millis() as u64,
             top_score: bm25_ranked.first().map(|(_, s)| *s as f64),
         };
@@ -948,9 +1021,9 @@ impl ToolRegistry {
 
         // 1. BM25 (lexical).
         let t = Instant::now();
-        let bm25_ranked = self.bm25_index().search(query, depth);
+        let bm25_ranked = self.lexical_ranked(query, depth);
         let bm25_stage = SearchStage {
-            name: "bm25".into(),
+            name: self.lexical_stage().into(),
             took_ms: t.elapsed().as_millis() as u64,
             top_score: bm25_ranked.first().map(|(_, s)| *s as f64),
         };
@@ -1119,6 +1192,8 @@ mod tests {
             sink: Arc::new(NoopSink),
             experimental_catalog_definitions: false,
             bm25: Bm25Cache::new(),
+            bm25f: Bm25fCache::new(),
+            field_weights: None,
             dense: DenseCache::with_embedder(embedder),
             graph: None,
         }
