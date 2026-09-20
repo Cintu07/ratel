@@ -11,8 +11,17 @@
 //! learner needs no new plumbing — it decorates whatever sink is already
 //! installed and forwards every event untouched.
 //!
-//! **One learner per session.** Two sessions sharing one learner would cross-pair
-//! their searches and invokes and record edges nobody produced.
+//! **Pairing is keyed by `turn_id`.** [`crate::trace::TraceEventContext::turn_id`]
+//! is a caller-supplied id correlating one logical turn's search with the
+//! invoke(s) that confirm it — distinct from the trace-*stream* `session_id`
+//! fixed at sink construction. A learner shared by multiple concurrent
+//! sessions stays correct as long as each supplies its own `turn_id`. A
+//! caller that never supplies one shares the one `None` slot, reproducing the
+//! original single-slot behavior — including its cross-session collisions —
+//! as the accepted cost of opting out. Because that slot is keyed by `None`
+//! rather than a sentinel *string*, a caller who explicitly supplies an empty
+//! `turn_id` does not collide with it — it gets its own slot, like any other
+//! value.
 //!
 //! # What counts as evidence
 //!
@@ -47,16 +56,66 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::trace::{Origin, TraceEnvelope, TraceEvent, TraceEventContext, TraceSink};
-use crate::usage::{Capability, IntentGraph, Observation};
+use crate::usage::{BoundedMap, Capability, IntentGraph, Observation};
 
-/// The learner's most recent search — the query an invoke attributes to. Kept
-/// per-learner (not read from the shared graph) so a concurrent search from
-/// another session cannot misattribute this learner's invoke. Whether the
+/// The most recent search per pending turn — the query an invoke under that
+/// turn attributes to. Kept per-learner (not read from the shared graph) so a
+/// concurrent search under a *different* `turn_id`, from another session
+/// sharing this learner, cannot misattribute this turn's invoke. Whether the
 /// question has already been credited a support bump lives on the shared graph
 /// ([`IntentGraph::claim_credit`]), so per-catalog tool and skill learners count
 /// one fanned-out question once between them, not once each.
 struct Pending {
     query: String,
+    /// What the question surfaced, **kept per capability kind**. One logical
+    /// question emits a `Search` and a `SkillSearch`, and a single learner can
+    /// see both, so one slot would let the second overwrite the first and land
+    /// skill ids in a cluster's tool map.
+    tools: Surfaced,
+    skills: Surfaced,
+}
+
+/// One kind's impressions for one search window.
+#[derive(Default)]
+struct Surfaced {
+    /// Ids the search put in front of the caller, from the event's `hits`.
+    ids: Vec<String>,
+    /// Whether they have already been counted. One search followed by three
+    /// invokes must add three edges but one impression each, so the first
+    /// confirm takes them and the rest see an empty slice.
+    ///
+    /// Per-window rather than the graph's `first_confirmation` credit: that
+    /// token is claimed by whichever of the tool and skill learners invokes
+    /// first, so gating on it would drop the tool impressions whenever a skill
+    /// invoke won the race.
+    counted: bool,
+}
+
+impl Pending {
+    fn slot(&mut self, kind: Capability) -> &mut Surfaced {
+        match kind {
+            Capability::Tool => &mut self.tools,
+            Capability::Skill => &mut self.skills,
+        }
+    }
+}
+
+/// The ids a caller plausibly *considered*, given which one they took: every id
+/// ranked at or above it, inclusive.
+///
+/// The denominator has to mean "weighed and passed over", not "returned". A tool
+/// listed fifth when the caller took the first was very likely never read, and
+/// counting it as refused would penalise it for our own ranking — the position
+/// bias that makes an impression signal circular if it is fed back raw.
+///
+/// The invoked id absent from the list means the caller went outside what was
+/// surfaced, so nothing here was passed over in its favour: no impressions.
+fn considered(surfaced: &[String], invoked: &str) -> Vec<String> {
+    surfaced
+        .iter()
+        .position(|id| id == invoked)
+        .map(|cut| surfaced[..=cut].to_vec())
+        .unwrap_or_default()
 }
 
 /// Which searches may open an observation window.
@@ -139,16 +198,29 @@ impl ObservationPolicy {
 /// What one trace event means for learning, under a policy.
 ///
 /// **The pairing rule, in one place.** The live path and the replay path differ
-/// in where they keep pending state — a per-session learner holds a `Mutex`
-/// slot, a replay holds a map keyed by `session_id` — but they must agree
-/// exactly on *which event does what*, or a graph built from a log stops
-/// matching the one live learning would have grown from the same events. Having
-/// written that match twice, a later change (a new confirming event, a pairing
-/// strategy) would have to land in both with nothing forcing the second.
+/// in which id keys their pending-state map — the live path by `turn_id`
+/// alone, a replay by `(session_id, turn_id)` (see [`replay_log_into`]), since
+/// one replayed log can interleave several sessions that a live learner never
+/// sees together — but they must agree exactly on *which event does what*, or
+/// a graph built from a log stops matching the one live learning would have
+/// grown from the same events. Having written that match twice, a later change
+/// (a new confirming event, a pairing strategy) would have to land in both with
+/// nothing forcing the second.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Step<'a> {
-    /// This search opens an observation window for `query`.
-    Remember(&'a str),
+    /// This search opens an observation window for `query`, having surfaced
+    /// `surfaced`. A struct variant rather than a tuple so that adding the ids
+    /// is a compile error at **both** window implementations — the live sink
+    /// and the replay loop keep separate pending state and only share this
+    /// classifier.
+    Remember {
+        query: &'a str,
+        /// Which id space `surfaced` holds — a `Search` surfaces tools, a
+        /// `SkillSearch` skills, and a window keeps them apart.
+        kind: Capability,
+        /// Ids the caller was shown, best-first.
+        surfaced: Vec<&'a str>,
+    },
     /// This invocation closes one, confirming `capability_id` of `kind`.
     Confirm(Capability, &'a str),
     /// Not evidence — including a search the policy rejects, which is **ignored
@@ -161,12 +233,26 @@ pub(crate) fn classify(event: &TraceEvent, policy: ObservationPolicy) -> Step<'_
     match event {
         // Both search kinds open a window: a capability search hits the tool and
         // skill registries in turn with the same text.
-        TraceEvent::Search { query, origin, .. }
-        | TraceEvent::SkillSearch { query, origin, .. }
-            if accepts(policy, *origin) =>
-        {
-            Step::Remember(query)
-        }
+        TraceEvent::Search {
+            query,
+            origin,
+            hits,
+            ..
+        } if accepts(policy, *origin) => Step::Remember {
+            query,
+            kind: Capability::Tool,
+            surfaced: hits.iter().map(|h| h.tool_id.as_str()).collect(),
+        },
+        TraceEvent::SkillSearch {
+            query,
+            origin,
+            hits,
+            ..
+        } if accepts(policy, *origin) => Step::Remember {
+            query,
+            kind: Capability::Skill,
+            surfaced: hits.iter().map(|h| h.skill_id.as_str()).collect(),
+        },
         // The invocation the agent CHOSE to make. A trace records which tool was
         // called, never whether calling it was right, so completion is not a
         // second signal: filtering on `invoke_end` would drop good choices that
@@ -178,14 +264,18 @@ pub(crate) fn classify(event: &TraceEvent, policy: ObservationPolicy) -> Step<'_
 }
 
 /// Replay a whole trace log into `graph`, pairing searches with invokes
-/// **per session** while walking the log in its own order.
+/// **per `(session_id, turn_id)`** while walking the log in its own order.
 ///
 /// Both halves of that are load-bearing:
 ///
-/// - **Per-session pending state.** Sessions interleave in one log and share one
+/// - **Per-turn pending state.** Sessions interleave in one log and share one
 ///   graph; feeding them through a single pending slot would cross-pair one
-///   session's search with another's invoke and record edges nobody produced
-///   (the rule the module doc states for [`UsageLearner`] itself).
+///   turn's search with another's invoke and record edges nobody produced (the
+///   rule the module doc states for [`UsageLearner`] itself). A `turn_id` is
+///   what actually separates concurrent callers sharing one `session_id` — the
+///   topology `turn_id` exists for — so it is folded into the key alongside
+///   `session_id`; a log that never sets it falls back to the pre-`turn_id`
+///   per-session behavior.
 /// - **Log order, never re-sorted.** `JsonlSink` appends, so file order *is*
 ///   arrival order — what the live path saw. Sorting by `ts` would produce a
 ///   graph the live path could not have grown, since cluster membership depends
@@ -205,7 +295,8 @@ pub(crate) fn replay_log_into(
     embeddings: &HashMap<String, Vec<f32>>,
     fingerprint: Option<&str>,
 ) {
-    // session id -> (the query its next invoke attributes to, already credited).
+    // (session id, turn key) -> (the query its next invoke attributes to,
+    // already credited).
     //
     // The credit is tracked HERE rather than through [`IntentGraph::arm_credit`]
     // / [`claim_credit`]. That slot is global and keyed by query text, which is
@@ -213,44 +304,107 @@ pub(crate) fn replay_log_into(
     // agree, and identical text from two concurrent sessions is rare. In a
     // replay it is not rare: sessions interleave by construction and popular
     // questions repeat verbatim, so a shared slot loses the second session's
-    // observation every time. Replay knows the session, so it can be exact.
-    let mut pending: HashMap<&str, (&str, bool)> = HashMap::new();
+    // observation every time. Replay knows the session and the turn, so it can
+    // be exact.
+    //
+    // Keying by `session_id` alone reproduced the live path's pre-`turn_id`
+    // bug: this PR's target topology is one sink shared by concurrent app
+    // sessions, so every envelope carries the *same* `session_id` and differs
+    // only by `turn_id`. Adding `turn_id` to the key mirrors what the live path
+    // already does (see the module doc); a log that never sets `turn_id` still
+    // resolves to `None` for every envelope, so the per-session key collapses
+    // to exactly what it was before and existing logs replay unchanged.
+    /// One turn's open window: the query its next invoke attributes to,
+    /// whether that question has been credited, and what it surfaced per kind.
+    #[derive(Default)]
+    struct Window<'a> {
+        query: &'a str,
+        credited: bool,
+        tools: (Vec<&'a str>, bool),
+        skills: (Vec<&'a str>, bool),
+    }
+
+    let mut pending: HashMap<(&str, Option<&str>), Window<'_>> = HashMap::new();
 
     for env in envelopes {
         let session = env.session_id.as_str();
+        let turn_key = env.turn_id.as_deref();
+        let key = (session, turn_key);
         let (kind, capability_id) = match classify(&env.event, policy) {
-            Step::Remember(query) => {
-                // Re-arming with the same text is idempotent: a capability
-                // search fans one question to both catalogs, and both of those
-                // land before any invoke, so the turn still credits once.
-                pending.insert(session, (query, false));
+            Step::Remember {
+                query,
+                kind,
+                surfaced,
+            } => {
+                // Every search re-arms credit, matching `CreditSlot::arm` being
+                // called unconditionally on the live path: a turn that
+                // re-searches the same text after already invoking must be able
+                // to credit again. Re-arming with the same text is otherwise
+                // idempotent — a capability search fans one question to both
+                // catalogs, and both land before any invoke, so the turn still
+                // credits once. Each fills its OWN slot — one slot would let the
+                // skill search's ids overwrite the tool search's and land in the
+                // wrong map.
+                let entry = pending.entry(key).or_default();
+                if entry.query != query {
+                    *entry = Window {
+                        query,
+                        ..Window::default()
+                    };
+                }
+                entry.credited = false;
+                match kind {
+                    Capability::Tool => entry.tools = (surfaced, false),
+                    Capability::Skill => entry.skills = (surfaced, false),
+                }
                 continue;
             }
             Step::Confirm(kind, id) => (kind, id),
             Step::Ignore => continue,
         };
 
-        let Some(entry) = pending.get_mut(session) else {
+        let Some(entry) = pending.get_mut(&key) else {
             continue; // an invoke with no accepted search before it proves nothing
         };
-        let query = entry.0;
-        // The first confirming invoke of THIS session's question is what makes
-        // it an observation; later ones add edges for the same question.
-        let first_confirmation = !entry.1;
-        entry.1 = true;
-        // Stash this query's vector right before the observation reads it. The
-        // slot holds one entry, so with sessions interleaved anything set
-        // earlier may belong to another session's question.
+        if entry.query.is_empty() {
+            continue; // a slot created by `or_default` that no search ever filled
+        }
+        let query = entry.query;
+        // The first confirming invoke of THIS turn's question is what makes it
+        // an observation; later ones add edges for the same question.
+        let first_confirmation = !entry.credited;
+        entry.credited = true;
+        // Impressions belong to the search, not to each invoke that follows it,
+        // to the id space the invoke is in, and only to the ids at or above the
+        // invoked one — the ones plausibly weighed.
+        let slot = match kind {
+            Capability::Tool => &mut entry.tools,
+            Capability::Skill => &mut entry.skills,
+        };
+        let surfaced: Vec<String> = if slot.1 {
+            Vec::new()
+        } else {
+            let all: Vec<String> = slot.0.iter().map(|id| (*id).to_string()).collect();
+            let considered = considered(&all, capability_id);
+            slot.1 = !considered.is_empty();
+            considered
+        };
+        // Stash this query's vector right before the observation reads it,
+        // under this turn's key: replay walks the log sequentially, one
+        // envelope at a time, so nothing else under the same key can clobber it
+        // between the set and this same iteration's read.
         if let (Some(vector), Some(fp)) = (embeddings.get(query), fingerprint) {
-            graph.note_query_vector(query, vector, fp);
+            graph.note_query_vector(turn_key, query, vector, fp);
         }
         graph.observe(Observation {
+            turn_key,
             query,
             kind,
             capability_id,
             ts_ms: env.ts,
             first_confirmation,
             seeded: policy.provenance == Provenance::Seeded,
+            surfaced: &surfaced,
         });
     }
 }
@@ -319,8 +473,10 @@ fn accepts(policy: ObservationPolicy, origin: Origin) -> bool {
 pub struct UsageLearner {
     inner: Arc<dyn TraceSink>,
     graph: Arc<RwLock<IntentGraph>>,
-    /// The session's most recent search, awaiting an invoke to confirm it.
-    pending: Mutex<Option<Pending>>,
+    /// The most recent search per pending turn, awaiting an invoke to confirm
+    /// it. Keyed by `turn_id` (see the module doc); callers that never supply
+    /// one share the one `None` slot.
+    pending: Mutex<BoundedMap<Pending>>,
     policy: ObservationPolicy,
 }
 
@@ -343,7 +499,7 @@ impl UsageLearner {
         Self {
             inner,
             graph,
-            pending: Mutex::new(None),
+            pending: Mutex::new(BoundedMap::default()),
             policy,
         }
     }
@@ -367,42 +523,83 @@ impl UsageLearner {
     /// its own learner — the previous per-learner flag credited once *each*.
     /// Over-counting still needs a credit, then another search of the same text,
     /// then another credit — two real searches, which should count twice.
-    fn remember_query(&self, query: &str) {
+    fn remember_query(
+        &self,
+        turn_key: Option<&str>,
+        query: &str,
+        kind: Capability,
+        surfaced: &[&str],
+    ) {
         if let Ok(mut pending) = self.pending.lock() {
-            *pending = Some(Pending {
-                query: query.to_string(),
-            });
+            // A capability search reaches this learner twice — once as a
+            // `Search` and once as a `SkillSearch`, same text — so the second
+            // must fill its own slot rather than replace the window.
+            let same_question = pending.get(turn_key).is_some_and(|p| p.query == query);
+            if !same_question {
+                pending.insert(
+                    turn_key,
+                    Pending {
+                        query: query.to_string(),
+                        tools: Surfaced::default(),
+                        skills: Surfaced::default(),
+                    },
+                );
+            }
+            if let Some(p) = pending.get_mut(turn_key) {
+                *p.slot(kind) = Surfaced {
+                    ids: surfaced.iter().map(|id| (*id).to_string()).collect(),
+                    counted: false,
+                };
+            }
         }
         if let Ok(graph) = self.graph.read() {
-            graph.arm_credit(query);
+            graph.arm_credit(turn_key, query);
         }
     }
 
-    /// Pair `capability_id` with the pending query, if there is one.
+    /// Pair `capability_id` with the query pending under `turn_key`, if any.
     ///
     /// Best-effort throughout: trace events are observations, so a poisoned lock
     /// or a missing pending query drops the evidence rather than disturbing the
     /// agent loop (ADR-0007's query-log semantics).
-    fn confirm(&self, kind: Capability, capability_id: &str, ts_ms: u64) {
-        let Ok(pending) = self.pending.lock() else {
+    fn confirm(&self, turn_key: Option<&str>, kind: Capability, capability_id: &str, ts_ms: u64) {
+        let Ok(mut pending) = self.pending.lock() else {
             return;
         };
-        let Some(query) = pending.as_ref().map(|p| p.query.clone()) else {
+        let Some(entry) = pending.get_mut(turn_key) else {
             return; // an invoke with no search before it proves nothing
+        };
+        let query = entry.query.clone();
+        // Impressions belong to the search, not to each invoke that follows it
+        // (one search and three invokes is three edges but one impression each),
+        // and to the id space the invoke is in — a tool invoke never counts what
+        // the skill search surfaced.
+        let slot = entry.slot(kind);
+        let surfaced = if slot.counted {
+            Vec::new()
+        } else {
+            let considered = considered(&slot.ids, capability_id);
+            // Only a confirming invoke inside the surfaced list counts the
+            // window; one that went outside it leaves the window open, so a
+            // later invoke that did come from the list can still count.
+            slot.counted = !considered.is_empty();
+            considered
         };
         drop(pending);
         if let Ok(mut graph) = self.graph.write() {
             // The first invoke of this question, across every learner sharing the
             // graph, is what makes it an observation; the rest add edges for the
             // same question without re-bumping support.
-            let first_confirmation = graph.claim_credit(&query);
+            let first_confirmation = graph.claim_credit(turn_key, &query);
             graph.observe(Observation {
+                turn_key,
                 query: &query,
                 kind,
                 capability_id,
                 ts_ms,
                 first_confirmation,
                 seeded: self.policy.provenance == Provenance::Seeded,
+                surfaced: &surfaced,
             });
         }
     }
@@ -419,11 +616,12 @@ impl UsageLearner {
     /// Does **not** forward to the inner sink: replaying an old log must not
     /// re-emit its events into a live stream.
     ///
-    /// One learner covers one session. Feed envelopes from different
-    /// `session_id`s through separate learners, or their searches and invokes
-    /// cross-pair into edges nobody produced.
+    /// One learner may serve multiple concurrent sessions as long as each
+    /// supplies its own `turn_id` (see the module doc); envelopes carry
+    /// `turn_id` themselves, so no extra plumbing is needed here.
     pub fn replay(&self, envelope: &TraceEnvelope) {
-        self.learn_from(&envelope.event, envelope.ts);
+        let turn_key = envelope.turn_id.as_deref();
+        self.learn_from(&envelope.event, envelope.ts, turn_key);
     }
 
     /// The shared pairing step behind [`Self::replay`] and [`TraceSink::record`].
@@ -432,10 +630,16 @@ impl UsageLearner {
     /// cleared**. Clearing would let one of Ratel's own internal searches,
     /// landing between a captured query and its invokes, silently discard the
     /// turn's evidence.
-    fn learn_from(&self, event: &TraceEvent, ts_ms: u64) {
+    fn learn_from(&self, event: &TraceEvent, ts_ms: u64, turn_key: Option<&str>) {
         match classify(event, self.policy) {
-            Step::Remember(query) => self.remember_query(query),
-            Step::Confirm(kind, capability_id) => self.confirm(kind, capability_id, ts_ms),
+            Step::Remember {
+                query,
+                kind,
+                surfaced,
+            } => self.remember_query(turn_key, query, kind, &surfaced),
+            Step::Confirm(kind, capability_id) => {
+                self.confirm(turn_key, kind, capability_id, ts_ms)
+            }
             Step::Ignore => {}
         }
     }
@@ -443,17 +647,19 @@ impl UsageLearner {
 
 impl TraceSink for UsageLearner {
     fn record(&self, event: TraceEvent) {
-        self.learn_from(&event, now_ms());
+        self.learn_from(&event, now_ms(), None);
         self.inner.record(event);
     }
 
     fn record_with_context(&self, event: TraceEvent, context: TraceEventContext) {
-        self.learn_from(&event, now_ms());
+        let turn_key = context.turn_id.as_deref();
+        self.learn_from(&event, now_ms(), turn_key);
         self.inner.record_with_context(event, context);
     }
 
     fn record_envelope(&self, envelope: TraceEnvelope) {
-        self.learn_from(&envelope.event, envelope.ts);
+        let turn_key = envelope.turn_id.as_deref();
+        self.learn_from(&envelope.event, envelope.ts, turn_key);
         self.inner.record_envelope(envelope);
     }
 
@@ -473,6 +679,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::trace::{MemorySink, NoopSink, Origin};
+    use crate::usage::PENDING_CAP;
 
     fn learner() -> (Arc<UsageLearner>, Arc<RwLock<IntentGraph>>) {
         let graph = Arc::new(RwLock::new(IntentGraph::empty()));
@@ -548,6 +755,399 @@ mod tests {
         assert_eq!(
             g.intents[0].tools.keys().collect::<Vec<_>>(),
             vec!["gh_run_list"]
+        );
+    }
+
+    // ---- impressions: what a search surfaced ---------------------------------
+
+    /// `search`, but reporting `hits` — the field the learner discarded until
+    /// impressions existed.
+    fn search_showing(query: &str, hits: &[&str]) -> TraceEvent {
+        TraceEvent::Search {
+            query: query.into(),
+            origin: Origin::Agent,
+            top_k: 5,
+            hits: hits
+                .iter()
+                .enumerate()
+                .map(|(i, id)| crate::trace::SearchHitTrace {
+                    tool_id: (*id).into(),
+                    score: 10.0 - i as f64,
+                })
+                .collect(),
+            stages: Vec::new(),
+            took_ms: 0,
+        }
+    }
+
+    fn skill_search_showing(query: &str, hits: &[&str]) -> TraceEvent {
+        TraceEvent::SkillSearch {
+            query: query.into(),
+            origin: Origin::Agent,
+            top_k: 5,
+            hits: hits
+                .iter()
+                .enumerate()
+                .map(|(i, id)| crate::trace::SkillHitTrace {
+                    skill_id: (*id).into(),
+                    score: 10.0 - i as f64,
+                })
+                .collect(),
+            stages: Vec::new(),
+            took_ms: 0,
+        }
+    }
+
+    fn skill_invoke(skill_id: &str) -> TraceEvent {
+        TraceEvent::SkillInvoke {
+            skill_id: skill_id.into(),
+            took_ms: 0,
+        }
+    }
+
+    /// The counterpart to `what_retrieval_returned_never_becomes_an_edge`, which
+    /// still holds: a surfaced id is counted as a denominator and gets no edge.
+    /// Both assertions matter — recording impressions is only safe while the
+    /// edge map stays exactly what invocations put there.
+    #[test]
+    fn a_surfaced_tool_that_is_never_invoked_gets_no_edge() {
+        let (l, graph) = learner();
+        l.record(search_showing(
+            "why is the build broken",
+            &["docker_build", "gh_run_list"],
+        ));
+        l.record(invoke("gh_run_list"));
+
+        let g = graph.read().unwrap();
+        let it = &g.intents[0];
+        assert_eq!(
+            it.tools.keys().collect::<Vec<_>>(),
+            vec!["gh_run_list"],
+            "docker_build was shown, not used"
+        );
+        assert_eq!(it.surfaced_tools.get("docker_build"), Some(&1));
+        assert_eq!(it.surfaced_tools.get("gh_run_list"), Some(&1));
+        assert_eq!(it.support, 1, "still one question");
+    }
+
+    /// Three edges, one impression each: impressions belong to the search, edges
+    /// to the invokes. The `support` assertion is here for the same reason it is
+    /// on `several_invokes_after_one_search_all_count_as_capabilities` — an
+    /// edge-only assertion once passed while a count silently tripled.
+    #[test]
+    fn one_search_and_three_invokes_count_one_impression_each() {
+        let (l, graph) = learner();
+        l.record(search_showing(
+            "why is the build broken",
+            &["a", "b", "gh_run_list"],
+        ));
+        l.record(invoke("gh_run_list"));
+        l.record(invoke("gh_run_view"));
+        l.record(invoke("read_file"));
+
+        let g = graph.read().unwrap();
+        let it = &g.intents[0];
+        assert_eq!(it.tools.len(), 3, "three capabilities were used");
+        assert_eq!(
+            it.surfaced_tools.get("a"),
+            Some(&1),
+            "but one search showed them"
+        );
+        assert_eq!(it.surfaced_tools.get("b"), Some(&1));
+        assert_eq!(it.support, 1);
+    }
+
+    /// The denominator must mean "weighed and passed over", not "returned". A
+    /// tool listed below the one the caller took was very likely never read, and
+    /// counting it as refused would penalise it for where *we* ranked it — the
+    /// position bias that makes an impression signal circular.
+    #[test]
+    fn only_the_ids_ranked_above_the_invoked_one_count_as_seen() {
+        let (l, graph) = learner();
+        l.record(search_showing(
+            "why is the build broken",
+            &["docker_build", "gh_run_list", "read_file", "delete_file"],
+        ));
+        l.record(invoke("gh_run_list"));
+
+        let g = graph.read().unwrap();
+        let it = &g.intents[0];
+        assert_eq!(
+            it.surfaced_tools.get("docker_build"),
+            Some(&1),
+            "ranked above it"
+        );
+        assert_eq!(
+            it.surfaced_tools.get("gh_run_list"),
+            Some(&1),
+            "the one taken"
+        );
+        assert_eq!(
+            it.surfaced_tools.get("read_file"),
+            None,
+            "ranked below, unread"
+        );
+        assert_eq!(it.surfaced_tools.get("delete_file"), None);
+    }
+
+    /// Taking the top hit means nothing was passed over, so nothing is penalised
+    /// — the case that keeps a well-ranked tool from accumulating a denominator
+    /// simply by being right often.
+    #[test]
+    fn invoking_the_top_hit_counts_only_itself() {
+        let (l, graph) = learner();
+        l.record(search_showing(
+            "why is the build broken",
+            &["gh_run_list", "docker_build"],
+        ));
+        l.record(invoke("gh_run_list"));
+
+        let g = graph.read().unwrap();
+        assert_eq!(
+            g.intents[0].surfaced_tools.keys().collect::<Vec<_>>(),
+            vec!["gh_run_list"]
+        );
+    }
+
+    /// An invoke of something the search never returned proves nothing about
+    /// what it did return, so the window stays open for one that did.
+    #[test]
+    fn an_invoke_outside_the_surfaced_list_counts_no_impressions() {
+        let (l, graph) = learner();
+        l.record(search_showing(
+            "why is the build broken",
+            &["docker_build", "gh_run_list"],
+        ));
+        l.record(invoke("something_else"));
+        {
+            let g = graph.read().unwrap();
+            assert!(
+                g.intents[0].surfaced_tools.is_empty(),
+                "nothing was passed over"
+            );
+            assert!(g.intents[0].tools.contains_key("something_else"));
+        }
+        l.record(invoke("gh_run_list"));
+        let g = graph.read().unwrap();
+        assert_eq!(
+            g.intents[0].surfaced_tools.get("docker_build"),
+            Some(&1),
+            "the window was still open for an invoke from the list"
+        );
+    }
+
+    /// The skill twin of `a_surfaced_tool_that_is_never_invoked_gets_no_edge`.
+    /// A skill catalog learns from its own searches or the penalty is tool-only
+    /// in everything but name.
+    #[test]
+    fn a_surfaced_skill_that_is_never_invoked_gets_no_edge() {
+        let (l, graph) = learner();
+        l.record(skill_search_showing(
+            "write a changelog",
+            &["release-notes", "changelog"],
+        ));
+        l.record(skill_invoke("changelog"));
+
+        let g = graph.read().unwrap();
+        let it = &g.intents[0];
+        assert_eq!(
+            it.skills.keys().collect::<Vec<_>>(),
+            vec!["changelog"],
+            "release-notes was shown, not used"
+        );
+        assert_eq!(it.surfaced_skills.get("release-notes"), Some(&1));
+        assert!(
+            it.surfaced_tools.is_empty(),
+            "skill ids must never reach the tool map"
+        );
+    }
+
+    /// The two id spaces are why there are two maps. One logical question emits
+    /// a `Search` and a `SkillSearch`, and a single learner sees both — so the
+    /// second must not overwrite the first's slot.
+    #[test]
+    fn a_fanned_out_question_keeps_each_id_space_in_its_own_map() {
+        let (l, graph) = learner();
+        l.record(search_showing(
+            "why is the build broken",
+            &["docker_build", "gh_run_list"],
+        ));
+        l.record(skill_search_showing(
+            "why is the build broken",
+            &["triage-ci", "debug-build"],
+        ));
+        l.record(invoke("gh_run_list"));
+        l.record(skill_invoke("debug-build"));
+
+        let g = graph.read().unwrap();
+        let it = &g.intents[0];
+        assert_eq!(it.surfaced_tools.get("docker_build"), Some(&1));
+        assert_eq!(it.surfaced_tools.get("triage-ci"), None, "skill id leaked");
+        assert_eq!(it.surfaced_skills.get("triage-ci"), Some(&1));
+        assert_eq!(
+            it.surfaced_skills.get("docker_build"),
+            None,
+            "tool id leaked"
+        );
+        assert_eq!(it.support, 1, "still one question");
+    }
+
+    /// A tool invoke must not consume the skill search's impressions, and vice
+    /// versa — the counted flag is per kind, not per window.
+    #[test]
+    fn each_id_space_counts_its_impressions_independently() {
+        let (l, graph) = learner();
+        l.record(search_showing("deploy the service", &["kubectl_apply"]));
+        l.record(skill_search_showing("deploy the service", &["rollout"]));
+        l.record(invoke("kubectl_apply"));
+        l.record(invoke("kubectl_apply"));
+        l.record(skill_invoke("rollout"));
+
+        let g = graph.read().unwrap();
+        let it = &g.intents[0];
+        assert_eq!(it.surfaced_tools.get("kubectl_apply"), Some(&1), "once");
+        assert_eq!(
+            it.surfaced_skills.get("rollout"),
+            Some(&1),
+            "the tool invokes must not have consumed the skill slot"
+        );
+    }
+
+    /// Impressions are counted at confirm, not at search, so an abandoned search
+    /// teaches nothing at all — the same rule
+    /// `a_search_nobody_acts_on_teaches_nothing` pins for edges.
+    #[test]
+    fn a_search_nobody_acts_on_records_no_impressions() {
+        let (l, graph) = learner();
+        l.record(search_showing("why is the build broken", &["docker_build"]));
+        assert!(graph.read().unwrap().is_empty());
+    }
+
+    /// `Intent::surfaced` holds tool ids. A skill search carries skill ids, and
+    /// one map for both id spaces would let them collide.
+    #[test]
+    fn a_skill_search_records_no_tool_impressions() {
+        let (l, graph) = learner();
+        l.record(TraceEvent::SkillSearch {
+            query: "write a changelog".into(),
+            origin: Origin::Agent,
+            top_k: 5,
+            hits: vec![crate::trace::SkillHitTrace {
+                skill_id: "changelog".into(),
+                score: 9.9,
+            }],
+            stages: Vec::new(),
+            took_ms: 0,
+        });
+        l.record(invoke("gh_run_list"));
+
+        let g = graph.read().unwrap();
+        assert!(g.intents[0].surfaced_tools.is_empty());
+        assert_eq!(g.intents[0].tools.len(), 1, "the invoke still counted");
+    }
+
+    /// A capability search reaches the two catalogs as a `Search` and a
+    /// `SkillSearch` with the same text. Whichever lands second must not blank
+    /// the ids the first one carried.
+    #[test]
+    fn a_skill_search_does_not_erase_a_tool_searchs_impressions() {
+        let (l, graph) = learner();
+        l.record(search_showing("write a changelog", &["gh_release_create"]));
+        l.record(TraceEvent::SkillSearch {
+            query: "write a changelog".into(),
+            origin: Origin::Agent,
+            top_k: 5,
+            hits: Vec::new(),
+            stages: Vec::new(),
+            took_ms: 0,
+        });
+        l.record(invoke("gh_release_create"));
+
+        let g = graph.read().unwrap();
+        assert_eq!(
+            g.intents[0].surfaced_tools.get("gh_release_create"),
+            Some(&1)
+        );
+    }
+
+    /// Two searches of the same question count two sets of impressions, matching
+    /// the edge rule that `the_same_question_asked_twice_counts_twice`.
+    #[test]
+    fn asking_twice_counts_the_impressions_twice() {
+        let (l, graph) = learner();
+        for _ in 0..2 {
+            l.record(search_showing(
+                "why is the build broken",
+                &["docker_build", "gh_run_list"],
+            ));
+            l.record(invoke("gh_run_list"));
+        }
+        let g = graph.read().unwrap();
+        assert_eq!(g.intents[0].surfaced_tools.get("docker_build"), Some(&2));
+    }
+
+    /// The live sink and the replay loop keep pending state in two different
+    /// places and only share `classify`, so nothing but a test forces them to
+    /// count impressions the same way. `Intent`'s `PartialEq` deliberately
+    /// excludes `surfaced` — it is provenance, not identity — which means the
+    /// broader `building_from_a_log_reproduces_what_the_live_path_grows` cannot
+    /// catch a divergence here. This can.
+    #[test]
+    fn replay_counts_the_same_impressions_the_live_path_does() {
+        let log = [
+            search_showing("why is the build broken", &["docker_build", "gh_run_list"]),
+            invoke("gh_run_list"),
+            invoke("gh_run_view"),
+            search_showing("why is the build broken", &["docker_build", "gh_run_list"]),
+            invoke("gh_run_list"),
+        ];
+
+        let (l, live) = learner();
+        for event in &log {
+            l.record(event.clone());
+        }
+
+        let mut offline = IntentGraph::empty();
+        let envelopes: Vec<TraceEnvelope> = log
+            .iter()
+            .enumerate()
+            .map(|(i, event)| TraceEnvelope {
+                v: 2,
+                event_id: String::new(),
+                ts: i as u64 + 1,
+                session_id: "s1".into(),
+                source_id: String::new(),
+                invocation_id: None,
+                catalog_version: None,
+                environment: None,
+                end_user_id: None,
+                trace_id: None,
+                span_id: None,
+                turn_id: None,
+                event: event.clone(),
+            })
+            .collect();
+        replay_log_into(
+            &mut offline,
+            &envelopes,
+            ObservationPolicy::default(),
+            &HashMap::new(),
+            None,
+        );
+
+        assert_eq!(
+            offline.intents[0].surfaced_tools,
+            live.read().unwrap().intents[0].surfaced_tools,
+            "the two windows disagree about what was surfaced"
+        );
+        assert_eq!(
+            offline.intents[0].surfaced_tools.get("docker_build"),
+            Some(&2)
+        );
+        assert_eq!(
+            offline.intents[0].support,
+            live.read().unwrap().intents[0].support,
+            "replay must credit the same number of observations as live learning"
         );
     }
 
@@ -686,6 +1286,255 @@ mod tests {
         );
     }
 
+    // ---- turn_id: multi-session pairing -------------------------------
+
+    fn search_with_turn(query: &str, turn_id: &str) -> (TraceEvent, TraceEventContext) {
+        (
+            search(query),
+            TraceEventContext {
+                turn_id: Some(turn_id.into()),
+                ..TraceEventContext::default()
+            },
+        )
+    }
+
+    fn invoke_with_turn(tool_id: &str, turn_id: &str) -> (TraceEvent, TraceEventContext) {
+        (
+            invoke(tool_id),
+            TraceEventContext {
+                turn_id: Some(turn_id.into()),
+                ..TraceEventContext::default()
+            },
+        )
+    }
+
+    #[test]
+    fn two_concurrent_sessions_with_turn_ids_do_not_cross_pair() {
+        // The exact bug this module fixes: one learner (e.g. one ToolCatalog's
+        // IntentGraph shared by two agent sessions) sees session A's search,
+        // then session B's search overwrites the pending slot, then A invokes —
+        // without turn_id, the graph would wrongly learn B's query -> A's tool.
+        let (l, graph) = learner();
+        let (e, c) = search_with_turn("delete a stale branch", "session-a");
+        l.record_with_context(e, c);
+        let (e, c) = search_with_turn("rotate the signing key", "session-b");
+        l.record_with_context(e, c);
+        let (e, c) = invoke_with_turn("git_branch_delete", "session-a");
+        l.record_with_context(e, c);
+        let (e, c) = invoke_with_turn("vault_rotate", "session-b");
+        l.record_with_context(e, c);
+
+        let g = graph.read().unwrap();
+        assert_eq!(g.len(), 2, "two distinct questions, two clusters");
+        let a = g
+            .intents
+            .iter()
+            .find(|i| i.members.contains(&"delete a stale branch".to_string()))
+            .expect("session A's query should have its own cluster");
+        assert_eq!(
+            a.tools.keys().collect::<Vec<_>>(),
+            vec!["git_branch_delete"],
+            "session A's invoke must pair with session A's search, not B's"
+        );
+        let b = g
+            .intents
+            .iter()
+            .find(|i| i.members.contains(&"rotate the signing key".to_string()))
+            .expect("session B's query should have its own cluster");
+        assert_eq!(
+            b.tools.keys().collect::<Vec<_>>(),
+            vec!["vault_rotate"],
+            "session B's invoke must pair with session B's search, not A's"
+        );
+    }
+
+    #[test]
+    fn an_explicit_empty_turn_id_does_not_share_the_slot_of_a_caller_who_never_opted_in() {
+        // Review comment #4's exact scenario, end to end through the live
+        // learner: caller A supplies `turn_id: Some("")` (e.g. a session id
+        // that resolved to an empty string) believing it opted in; caller B
+        // never supplies one at all (`None`). Interleaved, A's invoke must not
+        // land on B's question just because both keys used to collapse to the
+        // same string sentinel.
+        let (l, graph) = learner();
+        let (e, c) = search_with_turn("rotate the signing key", "");
+        l.record_with_context(e, c);
+        l.record(search("delete a stale branch")); // caller B: no turn_id at all
+        let (e, c) = invoke_with_turn("vault_rotate", "");
+        l.record_with_context(e, c);
+        l.record(invoke("git_branch_delete"));
+
+        let g = graph.read().unwrap();
+        assert_eq!(g.len(), 2, "two distinct questions, two clusters");
+        let a = g
+            .intents
+            .iter()
+            .find(|i| i.members.contains(&"rotate the signing key".to_string()))
+            .expect("caller A's (Some(\"\")) query should have its own cluster");
+        assert_eq!(
+            a.tools.keys().collect::<Vec<_>>(),
+            vec!["vault_rotate"],
+            "caller A's invoke must pair with caller A's search, not B's"
+        );
+        let b = g
+            .intents
+            .iter()
+            .find(|i| i.members.contains(&"delete a stale branch".to_string()))
+            .expect("caller B's (None) query should have its own cluster");
+        assert_eq!(
+            b.tools.keys().collect::<Vec<_>>(),
+            vec!["git_branch_delete"],
+            "caller B's invoke must pair with caller B's search, not A's"
+        );
+    }
+
+    #[test]
+    fn no_turn_id_reproduces_todays_single_slot_pairing_exactly() {
+        // The backward-compat proof: the same interleaving, with no turn_id on
+        // either side, keeps the pre-turn_id single-slot behavior byte for
+        // byte, cross-session collision included.
+        let (l, graph) = learner();
+        l.record(search("delete a stale branch"));
+        l.record(search("rotate the signing key"));
+        l.record(invoke("git_branch_delete"));
+        l.record(invoke("vault_rotate"));
+
+        let g = graph.read().unwrap();
+        assert_eq!(g.len(), 1, "only the later query was pending");
+        assert!(
+            g.intents[0]
+                .members
+                .contains(&"rotate the signing key".to_string())
+        );
+        assert_eq!(
+            g.intents[0].tools.keys().collect::<Vec<_>>(),
+            vec!["git_branch_delete", "vault_rotate"],
+            "both invokes cross-paired onto the one pending query, as before"
+        );
+    }
+
+    fn envelope(ts: u64, session: &str, turn_id: Option<&str>, event: TraceEvent) -> TraceEnvelope {
+        TraceEnvelope {
+            v: 2,
+            event_id: String::new(),
+            ts,
+            session_id: session.into(),
+            source_id: String::new(),
+            invocation_id: None,
+            catalog_version: None,
+            environment: None,
+            end_user_id: None,
+            trace_id: None,
+            span_id: None,
+            turn_id: turn_id.map(Into::into),
+            event,
+        }
+    }
+
+    #[test]
+    fn replay_keys_pending_state_by_turn_id_not_just_session_id() {
+        // The exact live-path bug (see `two_concurrent_sessions_with_turn_ids_do_not_cross_pair`
+        // above), reproduced offline: this PR's target topology is one sink shared
+        // by concurrent app sessions, so every envelope carries the SAME
+        // `session_id` and differs only by `turn_id`. If replay keys pending
+        // state by `session_id` alone, session B's search silently overwrites
+        // session A's pending query and A's invoke cross-pairs onto B's question
+        // — the very corruption `turn_id` exists to prevent, reintroduced in the
+        // offline path the live path already fixed.
+        let mut graph = IntentGraph::empty();
+        let log = vec![
+            envelope(1, "s1", Some("turn-a"), search("delete a stale branch")),
+            envelope(2, "s1", Some("turn-b"), search("rotate the signing key")),
+            envelope(3, "s1", Some("turn-a"), invoke("git_branch_delete")),
+            envelope(4, "s1", Some("turn-b"), invoke("vault_rotate")),
+        ];
+
+        replay_log_into(
+            &mut graph,
+            &log,
+            ObservationPolicy::default(),
+            &HashMap::new(),
+            None,
+        );
+
+        assert_eq!(graph.len(), 2, "two distinct questions, two clusters");
+        let a = graph
+            .intents
+            .iter()
+            .find(|i| i.members.contains(&"delete a stale branch".to_string()))
+            .expect("turn-a's query should have its own cluster");
+        assert_eq!(
+            a.tools.keys().collect::<Vec<_>>(),
+            vec!["git_branch_delete"],
+            "turn-a's invoke must pair with turn-a's search, not turn-b's"
+        );
+        let b = graph
+            .intents
+            .iter()
+            .find(|i| i.members.contains(&"rotate the signing key".to_string()))
+            .expect("turn-b's query should have its own cluster");
+        assert_eq!(
+            b.tools.keys().collect::<Vec<_>>(),
+            vec!["vault_rotate"],
+            "turn-b's invoke must pair with turn-b's search, not turn-a's"
+        );
+    }
+
+    #[test]
+    fn replay_with_no_turn_id_reproduces_todays_single_slot_pairing_exactly() {
+        // Backward-compat proof for the offline path, mirroring the live-path
+        // one above: a log that never sets `turn_id` keeps the pre-`turn_id`
+        // per-session single-slot behavior byte for byte.
+        let mut graph = IntentGraph::empty();
+        let log = vec![
+            envelope(1, "s1", None, search("delete a stale branch")),
+            envelope(2, "s1", None, search("rotate the signing key")),
+            envelope(3, "s1", None, invoke("git_branch_delete")),
+            envelope(4, "s1", None, invoke("vault_rotate")),
+        ];
+
+        replay_log_into(
+            &mut graph,
+            &log,
+            ObservationPolicy::default(),
+            &HashMap::new(),
+            None,
+        );
+
+        assert_eq!(graph.len(), 1, "only the later query was pending");
+        assert!(
+            graph.intents[0]
+                .members
+                .contains(&"rotate the signing key".to_string())
+        );
+        assert_eq!(
+            graph.intents[0].tools.keys().collect::<Vec<_>>(),
+            vec!["git_branch_delete", "vault_rotate"],
+            "both invokes cross-paired onto the one pending query, as before"
+        );
+    }
+
+    #[test]
+    fn pending_map_evicts_oldest_past_pending_cap() {
+        let (l, graph) = learner();
+        for i in 0..PENDING_CAP + 10 {
+            let turn_id = format!("turn-{i}");
+            let (e, c) = search_with_turn("some query", &turn_id);
+            l.record_with_context(e, c);
+        }
+        // The oldest turns were evicted, so their invokes now find nothing
+        // pending and teach the graph nothing.
+        let (e, c) = invoke_with_turn("t", "turn-0");
+        l.record_with_context(e, c);
+        assert!(graph.read().unwrap().is_empty());
+
+        // A turn within the cap window is still pending and pairs normally.
+        let last = format!("turn-{}", PENDING_CAP + 9);
+        let (e, c) = invoke_with_turn("t", &last);
+        l.record_with_context(e, c);
+        assert_eq!(graph.read().unwrap().len(), 1);
+    }
+
     #[test]
     fn skill_searches_and_skill_invokes_pair_on_the_skill_edges() {
         let (l, graph) = learner();
@@ -722,7 +1571,11 @@ mod tests {
         );
         assert_eq!(
             classify(&search_from("q", Origin::Baseline), policy),
-            Step::Remember("q")
+            Step::Remember {
+                query: "q",
+                kind: Capability::Tool,
+                surfaced: Vec::new(),
+            }
         );
     }
 
