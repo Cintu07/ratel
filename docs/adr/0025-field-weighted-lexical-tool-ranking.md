@@ -1,4 +1,4 @@
-# 23. Field-weighted lexical tool ranking (experimental BM25F)
+# 25. Field-weighted lexical tool ranking (experimental BM25F)
 
 Date: 2026-09-16
 
@@ -10,6 +10,12 @@ Extends [ADR-0004](0004-retrieval-and-tool-selection.md) (the stable `searchable
 projection and the BM25 scorer over it) and [ADR-0011](0011-selectable-retrieval-methods.md)
 (BM25 as the default, model-free ranker). Naming follows
 [ADR-0014](0014-adaptive-usage-ranking.md)'s experimental-surface convention.
+
+[ADR-0023](0023-searchable-text-indexes-names-not-schema-prose.md) changed the projection for
+every catalog and was reverted on the fixture's evidence. This record takes the shape that
+rejection argued for: opt-in per catalog, projection untouched. It feeds
+[ADR-0024](0024-hybrid-fuses-on-scores.md)'s score fusion through the same per-query ceiling
+as the flattened index.
 [Issue #56](https://github.com/ratel-ai/ratel/issues/56) is where this started, and the
 measurements below say it is not what #56 needs.
 
@@ -80,6 +86,10 @@ with the flattened default untouched.**
 - **Scoring is computed in-crate.** The `bm25` crate scores one flat document per id, so the
   experimental path reuses its `Tokenizer` (English stemming and stopwords, same vocabulary as
   today) and does its own accumulation, rather than building one engine per field.
+- **Fusion sees the same scale.** The field-weighted index answers `query_ceiling` with the
+  flattened index's definition, Σ IDF over the query's distinct terms, so ADR-0024 normalises
+  either lexical scorer alike. Query terms are deduplicated the same way. `k1` comes from the
+  catalog's `Bm25Params`; its `b` is replaced by the per-field values.
 - **Ordering is unchanged**: full-corpus rank, `(score desc, id asc)`, then cut to `top_k`.
 - **Traces name the stage `bm25f`**, so a run is attributable without reading the catalog
   config.
