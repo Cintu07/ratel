@@ -2,7 +2,7 @@ use crate::tool::Tool;
 
 /// A tool's ranking text, split by field. Joining the non-empty fields in
 /// this order is exactly [`searchable_text`], so the flattened projection
-/// (ADR-0004) and the field-weighted one (ADR-0023) cannot drift apart.
+/// (ADR-0004) and the field-weighted one (ADR-0025) cannot drift apart.
 pub(crate) struct ToolFields {
     pub(crate) name: String,
     pub(crate) description: String,

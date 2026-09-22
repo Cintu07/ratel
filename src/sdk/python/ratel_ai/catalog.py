@@ -38,11 +38,14 @@ from .telemetry import (
     trace_search_async,
 )
 
-Executor = Callable[[dict[str, Any]], Union[Awaitable[Any], Any]]
+Executor = Callable[..., Union[Awaitable[Any], Any]]
 """A tool handler: takes the tool's arguments dict, returns the result.
 
 May be sync or async (tool inputs are heterogeneous across the catalog);
-`ToolCatalog.invoke` absorbs the difference.
+`ToolCatalog.invoke` absorbs the difference. `Callable[..., ...]` rather than a
+precise arity because the capability-tool builders' own executors additionally
+take an optional trailing `turn_id: str | None` (correlating a search with the
+invoke(s) that confirm it, ADR-0014) that `Callable` cannot express as optional.
 """
 
 SearchOrigin = str
@@ -298,6 +301,9 @@ class ToolRegistry:
         embedding: EmbeddingSpec | None = None,
         *,
         method: SearchMethod = "bm25",
+        experimental_dense_weight: float | None = None,
+        experimental_bm25_k1: float | None = None,
+        experimental_bm25_b: float | None = None,
         experimental_embedding_artifact: ExperimentalEmbeddingArtifact | None = None,
     ) -> None: ...
 
@@ -363,6 +369,9 @@ class ToolRegistry:
         embedding: EmbeddingSpec | None = None,
         *,
         method: SearchMethod = "bm25",
+        experimental_dense_weight: float | None = None,
+        experimental_bm25_k1: float | None = None,
+        experimental_bm25_b: float | None = None,
         experimental_embedding_artifact: ExperimentalEmbeddingArtifact | None = None,
         spec: str | None = None,
         huggingface: str | None = None,
@@ -400,6 +409,10 @@ class ToolRegistry:
             download=download,
         )
         self._native = _NativeToolRegistry(**kwargs)
+        if experimental_dense_weight is not None:
+            self._native.set_experimental_dense_weight(experimental_dense_weight)
+        if experimental_bm25_k1 is not None or experimental_bm25_b is not None:
+            self._native.set_experimental_bm25_params(experimental_bm25_k1, experimental_bm25_b)
         self._eager = method in ("semantic", "hybrid")
         self._embedding_artifact = experimental_embedding_artifact
         self._warn_on_model_mismatch = True
@@ -648,6 +661,8 @@ class ToolRegistry:
         rebuild_on_model_change: bool = False,
         origins: OriginFilterOption | None = None,
         provenance: ProvenanceOption | None = None,
+        cluster_similarity: float | None = None,
+        cluster_coverage: float | None = None,
     ) -> None:
         """Turn on adaptive usage ranking against ``graph`` (ADR-0014).
 
@@ -681,7 +696,9 @@ class ToolRegistry:
             self._warn_on_model_mismatch = warn_on_model_mismatch
             self._rebuild_on_model_change = rebuild_on_model_change
             self._adaptive_warned = False
-            self._native.enable_adaptive_ranking(graph, origins, provenance)
+            self._native.enable_adaptive_ranking(
+            graph, origins, provenance, cluster_similarity, cluster_coverage
+        )
         self._maybe_warn_model_mismatch()
 
     def experimental_disable_adaptive_ranking(self) -> None:
@@ -707,6 +724,13 @@ class ToolRegistry:
 
     async def experimental_rebuild_intent_graph(self) -> None:
         """Re-embed the graph's members under the current model; preserves learning.
+
+        Also the repair for an **over-merged** graph. Clustering compares a query
+        against a cluster's individual members, and those per-member vectors are
+        held in memory rather than persisted, so a graph loaded from storage --
+        or grown by an older version -- matches on its centroid alone until a
+        rebuild refills them. A rebuild does not move cluster boundaries;
+        replaying a trace log, or relearning from scratch, is what re-clusters.
 
         Call after changing the embedding model: a graph's centroids are only
         comparable to queries from the model that built them, so on a swap the
@@ -765,6 +789,17 @@ class ToolRegistry:
         if self._adaptive_warned or not self._warn_on_model_mismatch:
             return
         status, built, active, dim_mismatch = self._native.adaptive_ranking_status()
+        if status == "active: policy drift":
+            self._adaptive_warned = True
+            warnings.warn(
+                f"ratel: intent graph clusters were drawn under {built}, but {active} is "
+                "now configured. Adaptive usage ranking is still ACTIVE -- the new policy "
+                "applies to future queries only. Existing clusters are NOT redrawn, and "
+                "rebuilding will not redraw them; replay a trace log through "
+                "experimental_build_intent_graph(), or relearn.",
+                stacklevel=2,
+            )
+            return
         if not status.startswith("paused"):
             return
         self._adaptive_warned = True
@@ -930,6 +965,9 @@ class ToolCatalog:
         trace: TraceSinkConfig | None = None,
         method: SearchMethod = "bm25",
         embedding: EmbeddingSpec | None = None,
+        experimental_dense_weight: float | None = None,
+        experimental_bm25_k1: float | None = None,
+        experimental_bm25_b: float | None = None,
         experimental_embedding_artifact: ExperimentalEmbeddingArtifact | None = None,
     ) -> None:
         """Create an empty catalog.
@@ -944,6 +982,31 @@ class ToolCatalog:
             embedding: model for semantic/hybrid retrieval (a path string or a
                 keyed dict — see `EmbeddingSpec`). Retained and validated even
                 under "bm25" so a later async semantic override can use it.
+            experimental_dense_weight: share of the hybrid content score the
+                dense (semantic) arm carries; BM25 takes the remainder. Default
+                0.7, read by "hybrid" only. The default suits catalogs of
+                natural-language descriptions, which is where it was measured
+                (ADR-0024); a catalog keyed on exact identifiers, error codes,
+                or internal jargon gives the lexical arm purchase those corpora
+                do not have and wants a lower value. 0 is pure lexical, 1 pure
+                dense; anything outside [0, 1] raises rather than being clamped.
+                It does not scale the adaptive-ranking arm.
+            experimental_bm25_k1: term-frequency saturation. Default 0.9.
+            experimental_bm25_b: length normalisation. Default 0.4. The shipped
+                defaults assume tool-shaped documents — a short description
+                plus every schema token — so document length partly reflects
+                parameter count, not verbosity. BFCL measured b=0.75 as a
+                narrow winner on a corpus shaped like that (599 function-calling
+                scenarios, lexical arm only — ADR-0023/ADR-0024), worth trying
+                if your catalog looks similar. A catalog that sets
+                experimental_searchable_description everywhere skips schema
+                flattening and has near-uniform document length, and a catalog
+                of long-form documents (skills, not tool-call schemas) doesn't
+                resemble what BFCL measured — both suggest a different value.
+                No built-in evaluation ships alongside this: there is no way to
+                tell, from this package alone, whether an override helped your
+                corpus. Rejected (not clamped) outside their valid domain: k1
+                finite and >= 0, b finite and in [0, 1].
             experimental_embedding_artifact: build-time RAT1 to warm on register
                 (any method; default ``on_miss`` is ``"error"``). Each
                 ``register`` re-resolves and re-warms over the whole current
@@ -965,6 +1028,9 @@ class ToolCatalog:
         self._registry = ToolRegistry(
             embedding,
             method=method,
+            experimental_dense_weight=experimental_dense_weight,
+            experimental_bm25_k1=experimental_bm25_k1,
+            experimental_bm25_b=experimental_bm25_b,
             experimental_embedding_artifact=experimental_embedding_artifact,
         )
         if trace is not None:
@@ -1023,6 +1089,7 @@ class ToolCatalog:
         top_k: int,
         origin: SearchOrigin = "direct",
         method: SearchMethod | None = None,
+        turn_id: str | None = None,
     ) -> list[SearchHit]:
         """Rank registered tools synchronously with BM25.
 
@@ -1032,6 +1099,11 @@ class ToolCatalog:
             origin: who initiated the search — labels the trace event only.
             method: per-call override of the catalog's default retrieval
                 method ("bm25" | "semantic" | "hybrid").
+            turn_id: correlates this search with the invoke(s) that follow it
+                for adaptive ranking's pairing (ADR-0014) — pass the same id
+                to `invoke` for this turn when multiple concurrent sessions
+                share this catalog's graph. Omit to keep single-session
+                behavior.
 
         Returns:
             Up to `top_k` `SearchHit`s, best first.
@@ -1055,6 +1127,7 @@ class ToolCatalog:
             top_k,
             origin,
             lambda projection: self._registry.search_with_origin(query, top_k, origin, projection),
+            turn_id,
         )
 
     async def search_async(
@@ -1063,6 +1136,7 @@ class ToolCatalog:
         top_k: int,
         origin: SearchOrigin = "direct",
         method: SearchMethod | None = None,
+        turn_id: str | None = None,
     ) -> list[SearchHit]:
         """Rank tools asynchronously with BM25, semantic, or hybrid retrieval.
 
@@ -1078,6 +1152,7 @@ class ToolCatalog:
             lambda projection: self._registry.search_async(
                 query, top_k, origin, resolved_method, projection
             ),
+            turn_id,
         )
 
     def has(self, tool_id: str) -> bool:
@@ -1163,6 +1238,8 @@ class ToolCatalog:
         rebuild_on_model_change: bool = False,
         origins: OriginFilterOption | None = None,
         provenance: ProvenanceOption | None = None,
+        cluster_similarity: float | None = None,
+        cluster_coverage: float | None = None,
     ) -> None:
         """Turn on adaptive usage ranking against ``graph`` (ADR-0014).
 
@@ -1187,6 +1264,8 @@ class ToolCatalog:
             rebuild_on_model_change=rebuild_on_model_change,
             origins=origins,
             provenance=provenance,
+            cluster_similarity=cluster_similarity,
+            cluster_coverage=cluster_coverage,
         )
 
     async def experimental_rebuild_intent_graph(self) -> None:
@@ -1291,7 +1370,9 @@ class ToolCatalog:
         """Drain captured trace envelopes; `[]` unless the sink is "memory"."""
         return self._registry.drain_trace_events()
 
-    async def invoke(self, tool_id: str, args: dict[str, Any]) -> Any:
+    async def invoke(
+        self, tool_id: str, args: dict[str, Any], turn_id: str | None = None
+    ) -> Any:
         """Run a registered tool's handler and return its result.
 
         This is the canonical place that absorbs the sync/async executor
@@ -1305,6 +1386,10 @@ class ToolCatalog:
         Args:
             tool_id: id of a registered tool.
             args: the arguments dict passed to the handler.
+            turn_id: correlates this invoke with the search that found
+                `tool_id`, for adaptive ranking's pairing (ADR-0014) — pass
+                the same id given to `search`/`search_async` for this turn.
+                Omit to keep single-session behavior.
 
         Returns:
             Whatever the handler returns (awaited if it returned an awaitable).
@@ -1382,7 +1467,7 @@ class ToolCatalog:
 
         # The `execute_tool` OTel span wraps the local trace stream; both record the
         # same invocation, on their two independent channels (ADR-0007).
-        return await trace_execute_tool(tool_id, args, _run)
+        return await trace_execute_tool(tool_id, args, _run, turn_id)
 
 
 def _args_size_bytes(args: Any) -> int:

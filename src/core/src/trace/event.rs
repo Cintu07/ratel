@@ -484,6 +484,30 @@ pub enum TraceEvent {
         /// The model now configured.
         active: String,
     },
+    /// The graph's clusters were drawn under a different [`crate::ClusterPolicy`]
+    /// than the one now in force.
+    ///
+    /// **A notice, not a pause.** Unlike a model swap, nothing here is
+    /// meaningless: the vectors are fine and the clusters are still coherent,
+    /// merely coarser or finer than the current setting would draw them. The arm
+    /// keeps serving.
+    ///
+    /// What it reports is that those boundaries **will not be redrawn**. Nothing
+    /// can redraw them in place — a cluster's edges are aggregate counts with no
+    /// member attribution to split on — so a rebuild is the wrong remedy here,
+    /// and this deliberately does not travel under the model event or the paused
+    /// status that would summon one. Re-deriving boundaries means replaying the
+    /// trace log, or relearning.
+    UsageClusterPolicyChanged {
+        /// Similarity the existing boundaries were drawn under.
+        built_similarity: f64,
+        /// Coverage fraction the existing boundaries were drawn under.
+        built_coverage: f64,
+        /// Similarity now in force.
+        active_similarity: f64,
+        /// Coverage fraction now in force.
+        active_coverage: f64,
+    },
     /// Emitted once when a semantic/hybrid search finds the attached intent
     /// graph's centroids were built with a *different* embedding model than the
     /// active one, so cosine across the two spaces would be meaningless. Unlike
@@ -688,6 +712,14 @@ pub struct TraceEventContext {
     pub trace_id: Option<String>,
     /// Active OpenTelemetry span id, when available.
     pub span_id: Option<String>,
+    /// Caller-supplied id correlating one logical turn's search with the
+    /// invoke(s) that confirm it, for [`crate::UsageLearner`]'s pairing.
+    /// Distinct from `session_id`: that names which trace *stream* an event
+    /// is written to (fixed once per sink), while this names which search a
+    /// later invoke attributes to — the concept multiple concurrent sessions
+    /// sharing one sink/learner need to stay untangled. Absent means "share
+    /// the single legacy pairing slot," reproducing pre-`turn_id` behavior.
+    pub turn_id: Option<String>,
 }
 
 impl TraceEventContext {
@@ -739,6 +771,9 @@ pub struct TraceEnvelope {
     /// Active OpenTelemetry span id, when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub span_id: Option<String>,
+    /// See [`TraceEventContext::turn_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     /// The event itself, flattened into the envelope on the wire.
     #[serde(flatten)]
     pub event: TraceEvent,

@@ -1,5 +1,5 @@
 //! The catalog from issue #56, ranked by the flattened scorer and by
-//! experimental field weights (ADR-0023).
+//! experimental field weights (ADR-0025).
 
 use ratel_ai_core::{FieldParams, FieldWeights, Tool, ToolRegistry};
 use serde_json::json;

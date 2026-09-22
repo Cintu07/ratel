@@ -1,6 +1,6 @@
 //! Field-weighted lexical ranking (BM25F) over a tool's name, description and
 //! schema — the experimental alternative to scoring one flattened document
-//! (ADR-0023).
+//! (ADR-0025).
 //!
 //! The flat projection lets a query's throwaway verb outrank its intent noun
 //! when the verb happens to sit in a shorter description (issue #56). Scoring
@@ -14,10 +14,10 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use bm25::{DefaultTokenizer, Language, Tokenizer};
+use bm25::Tokenizer;
 
 use crate::indexing::ToolFields;
-use crate::search::BM25_K1;
+use crate::search::{Bm25Params, distinct_terms, tokenizer};
 
 /// How much one field counts, and how hard its length is normalized.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -45,7 +45,7 @@ impl Default for FieldWeights {
     /// Provisional defaults: the name counts most and is barely
     /// length-normalized (it is a handful of tokens, and a longer name is not
     /// a worse match), schema tokens count least because they repeat across a
-    /// catalog. The numbers are tuning, not contract — ADR-0023 settles them
+    /// catalog. The numbers are tuning, not contract — ADR-0025 settles them
     /// against `ratel-bench` before this graduates.
     fn default() -> Self {
         Self {
@@ -86,17 +86,20 @@ pub(crate) struct Bm25fIndex {
     /// score and IDF is what it always was.
     doc_freq: HashMap<String, f32>,
     avg_len: [f32; FIELDS],
-    params: [FieldParams; FIELDS],
-    tokenizer: DefaultTokenizer,
+    fields: [FieldParams; FIELDS],
+    /// Term-frequency saturation, from the registry's [`Bm25Params`]. Its `b`
+    /// has no meaning here: length normalisation is per field, so each field's
+    /// own `b` replaces it.
+    k1: f32,
 }
 
 impl Bm25fIndex {
     /// Tokenize and index `docs` field by field.
-    pub(crate) fn build<I>(docs: I, weights: FieldWeights) -> Self
+    pub(crate) fn build<I>(docs: I, weights: FieldWeights, params: Bm25Params) -> Self
     where
         I: IntoIterator<Item = (String, ToolFields)>,
     {
-        let tokenizer = DefaultTokenizer::new(Language::English);
+        let tokenizer = tokenizer();
         let mut indexed: Vec<FieldDoc> = Vec::new();
         let mut doc_freq: HashMap<String, f32> = HashMap::new();
         let mut totals = [0f32; FIELDS];
@@ -130,14 +133,35 @@ impl Bm25fIndex {
             docs: indexed,
             doc_freq,
             avg_len,
-            params: [weights.name, weights.description, weights.schema],
-            tokenizer,
+            fields: [weights.name, weights.description, weights.schema],
+            k1: params.k1,
         }
+    }
+
+    /// The score an average-length document containing each query term once
+    /// would earn, which fusion divides by (ADR-0024). Same definition as the
+    /// flattened index: a term at average length in a weight-1.0 field
+    /// contributes its IDF unchanged, so both scorers normalise alike. A match
+    /// in a field weighted above 1.0 can exceed it, and the caller clamps.
+    pub(crate) fn query_ceiling(&self, query: &str) -> f32 {
+        let corpus = self.docs.len() as f32;
+        if corpus == 0.0 {
+            return 0.0;
+        }
+        distinct_terms(query)
+            .iter()
+            .map(|term| {
+                let df = self.doc_freq.get(term).copied().unwrap_or(0.0);
+                (1.0 + (corpus - df + 0.5) / (df + 0.5)).ln()
+            })
+            .sum()
     }
 
     /// Top-`top_k` matches as `(id, score)`, best-first, ties broken by id.
     pub(crate) fn search(&self, query: &str, top_k: usize) -> Vec<(String, f32)> {
-        let query_terms = self.tokenizer.tokenize(query);
+        // Distinct terms, like the flattened index: the ceiling counts each
+        // term once, so the score has to as well.
+        let query_terms = distinct_terms(query);
         if self.docs.is_empty() || query_terms.is_empty() {
             return Vec::new();
         }
@@ -159,7 +183,7 @@ impl Bm25fIndex {
                     // The crate's IDF and saturation, with the per-field sum
                     // standing in for a single document's term frequency.
                     let idf = (1.0 + (corpus - df + 0.5) / (df + 0.5)).ln();
-                    score += idf * weighted_tf * (BM25_K1 + 1.0) / (BM25_K1 + weighted_tf);
+                    score += idf * weighted_tf * (self.k1 + 1.0) / (self.k1 + weighted_tf);
                 }
                 (score > 0.0).then(|| (doc.id.clone(), score))
             })
@@ -178,7 +202,7 @@ impl Bm25fIndex {
     /// by its own length and scaled by its own weight.
     fn weighted_tf(&self, doc: &FieldDoc, term: &str) -> f32 {
         let mut total = 0f32;
-        for (field, params) in self.params.iter().enumerate() {
+        for (field, params) in self.fields.iter().enumerate() {
             let Some(&tf) = doc.terms[field].get(term) else {
                 continue;
             };
@@ -214,6 +238,7 @@ impl Bm25fCache {
     pub(crate) fn get_or_build<I>(
         &self,
         weights: FieldWeights,
+        params: Bm25Params,
         docs: impl FnOnce() -> I,
     ) -> Arc<Bm25fIndex>
     where
@@ -223,7 +248,7 @@ impl Bm25fCache {
         match &*slot {
             Some(index) => Arc::clone(index),
             None => {
-                let index = Arc::new(Bm25fIndex::build(docs(), weights));
+                let index = Arc::new(Bm25fIndex::build(docs(), weights, params));
                 *slot = Some(Arc::clone(&index));
                 index
             }
@@ -248,7 +273,11 @@ mod tests {
     }
 
     fn index(docs: Vec<(&str, ToolFields)>, weights: FieldWeights) -> Bm25fIndex {
-        Bm25fIndex::build(docs.into_iter().map(|(id, f)| (id.to_string(), f)), weights)
+        Bm25fIndex::build(
+            docs.into_iter().map(|(id, f)| (id.to_string(), f)),
+            weights,
+            Bm25Params::default(),
+        )
     }
 
     #[test]
@@ -352,17 +381,17 @@ mod tests {
     #[test]
     fn the_cache_rebuilds_after_invalidate() {
         let cache = Bm25fCache::new();
-        let first = cache.get_or_build(FieldWeights::default(), || {
+        let first = cache.get_or_build(FieldWeights::default(), Bm25Params::default(), || {
             vec![(
                 "docs".to_string(),
                 fields("search_docs", "search documentation", ""),
             )]
         });
-        let cached = cache.get_or_build(FieldWeights::default(), Vec::new);
+        let cached = cache.get_or_build(FieldWeights::default(), Bm25Params::default(), Vec::new);
         assert!(Arc::ptr_eq(&first, &cached), "second call reuses the index");
 
         cache.invalidate();
-        let rebuilt = cache.get_or_build(FieldWeights::default(), || {
+        let rebuilt = cache.get_or_build(FieldWeights::default(), Bm25Params::default(), || {
             vec![(
                 "docs".to_string(),
                 fields("search_docs", "search documentation", ""),
